@@ -1,0 +1,126 @@
+#!/usr/bin/env python2.7
+
+import argparse, subprocess, os, gzip, logging, time
+from itertools import izip_longest
+from multiprocessing import Pool
+from collections import defaultdict
+
+logging.basicConfig(filename='WGS.log', filemode='w', format='%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S', level=logging.INFO)
+
+def main(args):
+
+	global_start_time = time.time()
+	strains = sorted([file.split('.')[0] for file in os.listdir(args.input) if 'R1' in file])
+
+	with open('Processing_Summary.txt','w') as out:
+		out.write('Strain\tRead1_pre\tRead1_post\tRead2_pre\tRead2_post\tBase1_pre\tBase1_post\tBase2_pre\tBase2_post\tPassed\tFailed_low\tFailed_N\tFailed_short\tReads_trimmed\tBases_trimmed\tDuplication\tInsert_size\tPairs\tZero_Concordant\tOne_Concordant\tMultiple_Concordant\tOne_Discordant\tUnpaired\tZero_Unpaired\tOne_Unpaired\tMultiple_Unpaired\tAlignment_Rate\n')
+
+	p = Pool(8)
+	data = p.map(processStrain, ((strain, args) for strain in strains))
+	#printSNPSummary(strains)
+
+	logging.info('Completed in %ds' % (time.time() - global_start_time))
+
+def processStrain(x):
+	strain = x[0][:-3]
+	args = x[1]
+
+	logging.info('\tProcessing %s' % (strain))
+	sample_start_time = time.time()
+	sample_summary = {}
+	sample_summary.update(trim(strain))
+	sample_summary.update(align(strain, args.hisatIndex))
+	#call_snps(strain, args.GATK_jar, args.GATK_fa)
+	move(strain)
+	logging.info('\tCompleted %s in %ds' % (strain, time.time()-sample_start_time))
+	writeSummary(strain, sample_summary)
+
+def trim(strain):
+	cmd = 'fastp -i fastq/%s_R1.fastq.gz -I fastq/%s_R2.fastq.gz -o trim/%s.R1.fastq.gz -O trim/%s.R2.fastq.gz --adapter_sequence CCGAGCCCACGAGAC --adapter_sequence_r2 GACGCTGCCGACGA --html trim_report/%s.html --json trim_report/%s.json --thread 2' % (strain, strain, strain, strain, strain, strain)
+	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+	(out, err) = proc.communicate()
+	info = err.split('\n')
+	s = {}
+	s['read1_pre'] = int(info[1].split(': ')[1])
+	s['base1_pre'] = int(info[2].split(': ')[1])
+	s['read1_post'] = int(info[7].split(': ')[1])
+	s['base1_post'] = int(info[8].split(': ')[1])
+	s['read2_pre'] = int(info[13].split(': ')[1])
+	s['base2_pre'] = int(info[14].split(': ')[1])
+	s['read2_post'] = int(info[19].split(': ')[1])
+	s['base2_post'] = int(info[20].split(': ')[1])
+	s['passed'] = int(info[25].split(': ')[1])
+	s['fail_low_quality'] = int(info[26].split(': ')[1])
+	s['fail_N'] = int(info[27].split(': ')[1])
+	s['fail_short'] = int(info[28].split(': ')[1])
+	s['reads_trimmed'] = int(info[29].split(': ')[1])
+	s['bases_trimmed'] = int(info[30].split(': ')[1])
+	s['duplication'] = float(info[32].split(': ')[1][:-1])
+	s['insert_size'] = int(info[34].split(': ')[1])
+	return s
+
+def align(strain, hisatIndex):
+	cmd = 'hisat2 -p 2 --maxins 3000 --phred33 --new-summary --no-spliced-alignment --rg-id %s --rg ID:%s --rg LB:20181202 --rg PL:illumina --rg SM:%s --rg PU:%s -x %s -1 trim/%s.R1.fastq.gz -2 trim/%s.R2.fastq.gz | samtools view -bh - -q 5 -F 260 | samtools sort - -o align/%s.bam' % (strain, strain, strain, strain, hisatIndex, strain, strain, strain)
+	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+	(out, err) = proc.communicate()
+	info = err.split('\n')
+	s = {}
+	s['pairs'] = int(info[1].split(': ')[1])
+	s['zero_align'] = int(info[2].split(': ')[1].split(' ')[0])
+	s['one_concordant'] = int(info[3].split(': ')[1].split(' ')[0])
+	s['multiple_concordant'] = int(info[4].split(': ')[1].split(' ')[0])
+	s['one_discordant'] = int(info[5].split(': ')[1].split(' ')[0])
+	s['unpaired'] = int(info[6].split(': ')[1])
+	s['zero_discordant_unpair'] = int(info[7].split(': ')[1].split(' ')[0])
+	s['one_discordant_unpair'] = int(info[8].split(': ')[1].split(' ')[0])
+	s['multiple_discordant_unpair'] = int(info[9].split(': ')[1].split(' ')[0])
+	s['alignment_rate'] = float(info[10].split(': ')[1][:-1])
+
+	cmd = 'samtools index align/%s.bam' % (strain)
+	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+	(out, err) = proc.communicate()
+	return s
+
+def call_snps(strain, GATK_jar, GATK_fa):
+	cmd = 'java -XX:ParallelGCThreads=1 -jar %s HaplotypeCaller --native-pair-hmm-threads 2 -R %s -ploidy 1 -I align/%s.bam -O snps/%s.vcf' % (GATK_jar, GATK_fa, strain, strain)
+	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+	(out, err) = proc.communicate()
+
+def move(strain):
+	cmd = 'mv fastq/%s_R1.fastq.gz complete/%s_R1.fastq.gz' % (strain, strain)
+	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+	(out, err) = proc.communicate()
+	cmd = 'mv fastq/%s_R2.fastq.gz complete/%s_R2.fastq.gz' % (strain, strain)
+	proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+	(out, err) = proc.communicate()
+
+def writeSummary(strain, data):
+	with open('Processing_Summary.txt','a') as out:
+		out.write('%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%f\n' % (strain,  data['read1_pre'], data['read1_post'], data['read2_pre'], data['read2_post'], data['base1_pre'], data['base1_post'], data['base2_pre'], data['base2_post'], data['passed'], data['fail_low_quality'], data['fail_N'], data['fail_short'], data['reads_trimmed'], data['bases_trimmed'], data['duplication'], data['insert_size'], data['pairs'], data['zero_align'], data['one_concordant'], data['multiple_concordant'], data['one_discordant'], data['unpaired'], data['zero_discordant_unpair'], data['one_discordant_unpair'], data['multiple_discordant_unpair'], data['alignment_rate']))
+
+def printSNPSummary(strains):
+	snps = defaultdict(int)
+	for strain in strains:
+		snp_file = open('snps/%s.vcf' % (strain))
+		for line in snp_file:
+			if line[0] != '#':
+				info = line.split('\t')
+				snps[(info[0], info[1], info[3], info[4])] += 1
+	with open('SNP_Summary.txt','w') as out:
+		out.write('Chromosome\tPosition\tReference\tAlternate\tStrainCount\n')
+		for snp in snps:
+			out.write('%s\t%s\t%s\t%s\t%d\n' % (snp[0], snp[1], snp[2], snp[3], snps[snp]))
+
+def parseArguments():
+	parser = argparse.ArgumentParser(prog="MPE_PipeLine_PE", description='', usage='%(prog)s [options]')
+	required = parser.add_argument_group('required arguments')
+	alignment = parser.add_argument_group('Alignment Options')
+	GATK = parser.add_argument_group('GATK Options')
+	required.add_argument('-i', '--input', required=True, help=' Folder of files to run. (fastq.gz)', metavar='', dest='input')
+	alignment.add_argument('--hisat_index', default='~/Lab/Genomes/pombe/hisat/sp_hisatIndex_v2.30', help=' Location of hisat index files.', dest='hisatIndex')
+	GATK.add_argument('--GATK-jar', default='/opt/gatk-4.0.11.0/gatk-package-4.0.11.0-local.jar', help=' Location of GATK jar', dest='GATK_jar')
+	GATK.add_argument('--GATK-genome', default='/home/zdwyer/Lab/Genomes/pombe/sp_genome_v2.30.fa', help=' Location of genome file.', dest='GATK_fa')
+	return parser.parse_args()
+
+args = parseArguments()
+main(args)
